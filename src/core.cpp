@@ -37,7 +37,7 @@ bool manifest(const QString &path, const QJsonObject &obj) {
 } // namespace
 QStringList editableFields() {
   return {"TITLE", "ARTIST", "ALBUM",   "ALBUMARTIST", "TRACKNUMBER",
-          "DATE",  "GENRE",  "COMMENT", "LYRICS"};
+          "DATE",  "GENRE",  "COMMENT", "LYRICS",      "DISCNUMBER"};
 }
 Track readTrack(const QString &path, bool loadCover) {
   Track t;
@@ -181,6 +181,9 @@ WriteResult writeTrack(const Change &c, const QString &root) {
   for (auto it = c.fields.begin(); it != c.fields.end(); ++it)
     if (r.after.value(it.key()) != it.value())
       r.error += "\nПроверка не пройдена: " + it.key();
+  if (!c.cover && (r.after.cover != current.cover ||
+                   r.after.pictureCount != current.pictureCount))
+    r.error += "\nИзменилась невыбранная обложка";
   if (c.cover && r.after.cover != *c.cover)
     r.error += "\nПроверка обложки не пройдена";
   for (auto it = current.tags.begin(); it != current.tags.end(); ++it)

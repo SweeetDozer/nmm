@@ -1,5 +1,6 @@
 #pragma once
 #include "core.h"
+#include "online_dialogs.h"
 #include "search.h"
 #include <QAudioOutput>
 #include <QMediaPlayer>
@@ -61,6 +62,10 @@ private:
   QFuture<void> job;
   bool busy = false;
   MusicBrainz *source;
+  HttpClient *network;
+  std::unique_ptr<OnlineServices> online;
+  QAction *lyricsAction = nullptr;
+  void findLyrics();
   QList<QAction *> taskActions;
   QPushButton *cancelButton;
   QList<Change> searchChanges;

@@ -1,10 +1,11 @@
 #pragma once
 #include "core.h"
-#include <QtNetwork>
+#include "http.h"
 struct Candidate {
   QMap<QString, QString> fields;
   QString source, reason;
   bool reliable = false;
+  QString recordingId;
 };
 QList<Candidate> musicBrainzCandidates(const Track &track,
                                        const QByteArray &data);
@@ -21,18 +22,11 @@ signals:
 class MusicBrainz : public MetadataSource {
   Q_OBJECT
 public:
-  explicit MusicBrainz(QObject *parent = nullptr);
+  explicit MusicBrainz(QObject *parent = nullptr, HttpClient *client = nullptr);
   void lookup(const Track &track) override;
   void cancel() override;
-  void setContact(const QString &value) { contact = value; }
+  void setContact(const QString &value) { http->setContact(value); }
 
 private:
-  QNetworkAccessManager manager;
-  QNetworkReply *active = nullptr;
-  QTimer timer;
-  QElapsedTimer elapsed;
-  QString cache, contact;
-  bool stopped = false;
-  int delay = 1100;
-  void finish(const Track &, const QByteArray &, const QString &error = {});
+  HttpClient *http;
 };

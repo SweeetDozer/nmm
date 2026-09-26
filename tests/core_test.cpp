@@ -83,12 +83,43 @@ int main(int argc, char **argv) {
     auto stale = writeTrack(c, root + "/backups");
     check(!stale.error.isEmpty(), "Reject stale preview " + ext);
     auto second =
-        writeTrack(Change{readTrack(path), {{"TITLE", "Второе название"}}, {}},
+        writeTrack(Change{readTrack(path),
+                          {{"TITLE", "Второе название"},
+                           {"ALBUM", "Выбранное издание"},
+                           {"ALBUMARTIST", "Другой альбомный исполнитель"},
+                           {"DATE", "2024-03-02"},
+                           {"TRACKNUMBER", "7"},
+                           {"DISCNUMBER", "2"}},
+                          {}},
                    root + "/backups");
     check(second.error.isEmpty(), "Second write " + ext + second.error);
     check(second.after.cover == art, "Preserve cover " + ext);
     check(second.after.value("LYRICS") == c.fields["LYRICS"],
           "Preserve lyrics " + ext);
+    check(second.after.pictureCount == 1, "Preserve artwork count " + ext);
+    QImage otherImage(10, 10, QImage::Format_RGB32);
+    otherImage.fill(Qt::blue);
+    QByteArray otherArt;
+    QBuffer otherBuffer(&otherArt);
+    otherBuffer.open(QIODevice::WriteOnly);
+    otherImage.save(&otherBuffer, "PNG");
+    auto artworkOnly =
+        writeTrack(Change{readTrack(path), {}, otherArt}, root + "/backups");
+    check(artworkOnly.error.isEmpty(),
+          "Artwork-only write " + ext + artworkOnly.error);
+    check(artworkOnly.after.tags == second.after.tags,
+          "Artwork-only preserves all tags " + ext);
+    check(artworkOnly.after.cover == otherArt, "Artwork-only verified " + ext);
+    auto lyricOnly =
+        writeTrack(Change{readTrack(path),
+                          {{"LYRICS", "Новый обычный текст для проверки"}},
+                          {}},
+                   root + "/backups");
+    check(lyricOnly.error.isEmpty(),
+          "Lyrics-only write " + ext + lyricOnly.error);
+    check(lyricOnly.after.cover == otherArt, "Lyrics preserve artwork " + ext);
+    check(lyricOnly.after.value("ALBUM") == "Выбранное издание",
+          "Lyrics preserve selected release " + ext);
     auto removed =
         writeTrack(Change{readTrack(path), {{"COMMENT", ""}}, QByteArray()},
                    root + "/backups");

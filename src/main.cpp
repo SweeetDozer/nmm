@@ -3,7 +3,7 @@ int main(int argc, char **argv) {
   QApplication app(argc, argv);
   QCoreApplication::setOrganizationName("MusicOrder");
   QCoreApplication::setApplicationName("MusicOrder");
-  QCoreApplication::setApplicationVersion("0.1.0");
+  QCoreApplication::setApplicationVersion("0.2.0");
   Window window;
   window.show();
   if (app.arguments().contains("--smoke-test"))

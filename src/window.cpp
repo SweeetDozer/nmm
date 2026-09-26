@@ -12,7 +12,8 @@ QString fieldName(const QString &f) {
       {"ALBUM", "Альбом"},        {"ALBUMARTIST", "Исполнитель альбома"},
       {"TRACKNUMBER", "№ трека"}, {"DATE", "Год / дата"},
       {"GENRE", "Жанр"},          {"COMMENT", "Комментарий"},
-      {"LYRICS", "Текст песни"}};
+      {"LYRICS", "Текст песни"},  {"DISCNUMBER", "№ диска"},
+      {"PICTURE", "Обложка"}};
   return names.value(f, f);
 }
 QTableWidgetItem *cell(const QString &s) {
@@ -156,6 +157,9 @@ Window::Window() {
     preview(list);
   });
   add("MusicBrainz", [this] { search(); });
+  add("Текст песни", [this] { findLyrics(); });
+  lyricsAction = taskActions.last();
+  lyricsAction->setEnabled(false);
   add("Повторы", [this] { duplicates(); });
   toolbar->addSeparator();
   auto backups = toolbar->addAction("Копии и восстановление");
@@ -239,7 +243,12 @@ Window::Window() {
   log->setMaximumHeight(105);
   log->setPlaceholderText("Журнал операций. Резервные копии: " + storage);
   layout->addWidget(log);
-  source = new MusicBrainz(this);
+  network = new HttpClient(this);
+  online = std::make_unique<OnlineServices>(*network);
+  source = new MusicBrainz(this, network);
+  connect(
+      table->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+      [this] { lyricsAction->setEnabled(!busy && selected().size() == 1); });
   connect(source, &MetadataSource::ready, this, &Window::chooseCandidates);
   connect(cancelButton, &QPushButton::clicked, this, [this] {
     cancelled = true;
@@ -252,8 +261,10 @@ Window::Window() {
     }
   });
   setStyleSheet(
-      "QMainWindow{background:#161a21;color:#e5e9f0} QWidget{font-size:13px} "
-      "QTableView,QPlainTextEdit,QLineEdit,QComboBox{background:#202630;color:#"
+      "QMainWindow,QDialog{background:#161a21;color:#e5e9f0} "
+      "QWidget{font-size:13px} "
+      "QTableView,QListWidget,QPlainTextEdit,QLineEdit,QComboBox{background:#"
+      "202630;color:#"
       "e5e9f0;border:1px solid #374151;border-radius:5px;padding:5px} "
       "QTableView{alternate-background-color:#252c37;selection-background-"
       "color:#345b70} "
@@ -287,6 +298,8 @@ void Window::setBusy(bool b) {
   for (auto a : taskActions)
     a->setEnabled(!b);
   cancelButton->setEnabled(b);
+  if (lyricsAction)
+    lyricsAction->setEnabled(!b && selected().size() == 1);
   if (!b) {
     progress->setRange(0, 1);
     progress->setValue(1);
@@ -384,8 +397,8 @@ void Window::edit() {
   for (auto f : editableFields()) {
     if (f == "LYRICS") {
       lyrics = new QPlainTextEdit(t.value(f));
-      lyrics->setPlaceholderText(
-          "Только ручное редактирование; поиск текстов не выполняется");
+      lyrics->setPlaceholderText("Обычный текст. Поиск для выбранного трека — "
+                                 "кнопка «Текст песни» в главном окне");
       form->addRow(fieldName(f), lyrics);
     } else {
       auto e = new QLineEdit(t.value(f));
@@ -485,11 +498,18 @@ void Window::preview(QList<Change> changes) {
       "Файлы и звук не переименовываются и не перекодируются.");
   info->setWordWrap(true);
   v->addWidget(info);
-  auto grid = new QTableWidget(0, 5);
+  auto grid = new QTableWidget(0, 6);
+  grid->setObjectName("changesPreview");
   grid->setHorizontalHeaderLabels(
-      {"Применить", "Файл", "Поле", "Сейчас", "Предложение"});
+      {"Применить", "Файл", "Поле", "Сейчас", "Предложение", "Источник"});
   grid->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   grid->horizontalHeader()->setStretchLastSection(true);
+  for (int column : {1, 3, 4}) {
+    grid->horizontalHeader()->setSectionResizeMode(column,
+                                                   QHeaderView::Interactive);
+    grid->setColumnWidth(column, 210);
+  }
+  grid->setIconSize(QSize(64, 64));
   v->addWidget(grid, 1);
   struct Row {
     int change;
@@ -509,15 +529,61 @@ void Window::preview(QList<Change> changes) {
       grid->setItem(r, 2, cell(fieldName(f)));
       grid->setItem(r, 3, cell(before));
       grid->setItem(r, 4, cell(after));
+      grid->setItem(
+          r, 5, cell(c.sources.value(f, "Ручной выбор / локальная подсказка")));
+      if (f == "PICTURE") {
+        QPixmap oldArt, newArt;
+        oldArt.loadFromData(c.before.cover);
+        newArt.loadFromData(*c.cover);
+        grid->item(r, 3)->setIcon(QIcon(oldArt));
+        grid->item(r, 4)->setIcon(QIcon(newArt));
+        grid->setRowHeight(r, 80);
+      }
       rows << Row{i, f};
     };
     for (auto it = c.fields.begin(); it != c.fields.end(); ++it)
       if (c.before.value(it.key()) != it.value())
         add(it.key(), c.before.value(it.key()), it.value());
     if (c.cover && *c.cover != c.before.cover)
-      add("PICTURE", QString::number(c.before.cover.size()) + " байт",
-          QString::number(c.cover->size()) + " байт");
+      add("PICTURE",
+          c.before.pictureCount > 0
+              ? QString("Существующих обложек: %1 · %2 байт (первая)")
+                    .arg(c.before.pictureCount)
+                    .arg(c.before.cover.size())
+              : "Обложки нет",
+          (c.cover->isEmpty()
+               ? QString("Удаление всех обложек")
+               : (c.before.pictureCount > 0
+                      ? QString("ЗАМЕНА ВСЕХ существующих обложек")
+                      : QString("Добавление обложки")) +
+                     QString(" · %1 байт").arg(c.cover->size())));
   }
+  connect(grid, &QTableWidget::cellDoubleClicked, &d, [&](int row, int column) {
+    if (row < 0 || row >= rows.size())
+      return;
+    const auto entry = rows[row];
+    const auto &change = changes[entry.change];
+    if (entry.field == "PICTURE")
+      showFullImage(&d, column == 3 ? change.before.cover : *change.cover,
+                    column == 3 ? "Существующая обложка"
+                                : change.sources.value("PICTURE",
+                                                       "Предлагаемая обложка"));
+    else if (entry.field == "LYRICS") {
+      QDialog full(&d);
+      full.resize(800, 650);
+      full.setWindowTitle("Полный текст");
+      auto layout = new QVBoxLayout(&full);
+      auto text =
+          new QPlainTextEdit(column == 3 ? change.before.value("LYRICS")
+                                         : change.fields.value("LYRICS"));
+      text->setReadOnly(true);
+      layout->addWidget(text);
+      auto b = new QDialogButtonBox(QDialogButtonBox::Close);
+      connect(b, &QDialogButtonBox::rejected, &full, &QDialog::reject);
+      layout->addWidget(b);
+      full.exec();
+    }
+  });
   if (rows.isEmpty()) {
     message("Нет новых значений для предпросмотра. Выберите файлы в таблице.");
     return;
@@ -560,6 +626,8 @@ void Window::preview(QList<Change> changes) {
       auto row = rows[r];
       if (!chosen.contains(row.change))
         chosen[row.change] = Change{changes[row.change].before, {}, {}};
+      chosen[row.change].sources[row.field] =
+          changes[row.change].sources.value(row.field);
       if (row.field == "PICTURE")
         chosen[row.change].cover = changes[row.change].cover;
       else
@@ -567,7 +635,8 @@ void Window::preview(QList<Change> changes) {
             changes[row.change].fields[row.field];
       summary << grid->item(r, 1)->text() + "\n" + grid->item(r, 2)->text() +
                      ": " + grid->item(r, 3)->text() + " → " +
-                     grid->item(r, 4)->text();
+                     grid->item(r, 4)->text() +
+                     "\nИсточник: " + grid->item(r, 5)->text();
     }
   if (chosen.isEmpty())
     return;
@@ -638,7 +707,7 @@ void Window::search() {
           .value("musicbrainz/contact", "https://github.com/SweeetDozer/nmm")
           .toString();
   message("MusicBrainz: передаются название и исполнитель из тегов / имён. "
-          "User-Agent: MusicOrder/0.1.0 (" +
+          "User-Agent: MusicOrder/0.2.0 (" +
           contact + ")");
   source->setContact(contact);
   searchChanges.clear();
@@ -672,45 +741,34 @@ void Window::chooseCandidates(const Track &t,
   progress->setValue(searchDone);
   if (!error.isEmpty())
     message("MusicBrainz: " + error + " · " + t.path);
-  for (auto &c : candidates)
-    if (c.reliable) {
-      searchChanges << Change{t, c.fields, {}};
-      message(t.path + "\nНадёжное предложение: " + c.source + "\n" + c.reason);
-      QTimer::singleShot(0, this, &Window::nextSearch);
-      return;
-    }
-  QDialog d(this);
-  d.setWindowTitle("Проверка сомнительных предложений");
-  d.resize(950, 500);
-  auto v = new QVBoxLayout(&d);
-  auto label = new QLabel(t.path + "\nТекущие: " + t.value("ARTIST") + " — " +
-                          t.value("TITLE") + " · " + duration(t.duration));
-  label->setWordWrap(true);
-  v->addWidget(label);
-  auto list = new QListWidget;
-  for (auto &c : candidates)
-    list->addItem(c.fields.value("ARTIST") + " — " + c.fields.value("TITLE") +
-                  "\n" + c.source + "\n" + c.reason + "\n");
-  list->setWordWrap(true);
-  v->addWidget(list, 1);
-  auto buttons = new QDialogButtonBox;
-  auto use = buttons->addButton("В предпросмотр", QDialogButtonBox::AcceptRole);
-  auto skip = buttons->addButton("Пропустить", QDialogButtonBox::RejectRole);
-  auto stop =
-      buttons->addButton("Завершить поиск", QDialogButtonBox::DestructiveRole);
-  use->setEnabled(false);
-  connect(list, &QListWidget::currentRowChanged, &d,
-          [=](int r) { use->setEnabled(r >= 0); });
-  connect(use, &QPushButton::clicked, &d, &QDialog::accept);
-  connect(skip, &QPushButton::clicked, &d, &QDialog::reject);
-  connect(stop, &QPushButton::clicked, &d, [&] {
+  auto current = readTrack(t.path);
+  if (!current.error.isEmpty()) {
+    message(current.error);
+    QTimer::singleShot(0, this, &Window::nextSearch);
+    return;
+  }
+  RecordingDialog dialog(current, candidates, *online, this);
+  if (dialog.exec() == QDialog::Accepted)
+    searchChanges << dialog.proposal();
+  if (dialog.stopRequested())
     cancelled = true;
-    d.reject();
-  });
-  v->addWidget(buttons);
-  if (d.exec() == QDialog::Accepted && list->currentRow() >= 0)
-    searchChanges << Change{t, candidates[list->currentRow()].fields, {}};
   QTimer::singleShot(0, this, &Window::nextSearch);
+}
+void Window::findLyrics() {
+  const auto tracks = selected();
+  if (tracks.size() != 1)
+    return;
+  const auto track = readTrack(tracks.first().path);
+  if (!track.error.isEmpty()) {
+    message(track.error);
+    return;
+  }
+  LyricsDialog dialog(track, *online, this);
+  if (dialog.exec() == QDialog::Accepted) {
+    auto change = dialog.proposal();
+    if (change)
+      preview({*change});
+  }
 }
 void Window::duplicates() {
   if (model->tracks.isEmpty())

@@ -16,21 +16,13 @@ QString versions(QString s) {
   return found.join(" ");
 }
 } // namespace
-MusicBrainz::MusicBrainz(QObject *parent) : MetadataSource(parent) {
-  cache = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
-          "/musicbrainz";
-  QDir().mkpath(cache);
-  timer.setSingleShot(true);
-  elapsed.start();
+MusicBrainz::MusicBrainz(QObject *parent, HttpClient *client)
+    : MetadataSource(parent) {
+  http = client ? client : new HttpClient(this);
 }
-void MusicBrainz::cancel() {
-  stopped = true;
-  timer.stop();
-  if (active)
-    active->abort();
-}
+void MusicBrainz::cancel() { http->cancel(this); }
 void MusicBrainz::lookup(const Track &t) {
-  stopped = false;
+  cancel();
   auto local = localSuggestion(t);
   QString title =
       t.value("TITLE").isEmpty() ? local["TITLE"] : t.value("TITLE");
@@ -46,74 +38,21 @@ void MusicBrainz::lookup(const Track &t) {
   const QString fromFile = queryFor(local["TITLE"], local["ARTIST"]);
   if (query != fromFile)
     query = "(" + query + ") OR (" + fromFile + ")";
-  QString file =
-      cache + "/" +
-      QString::fromLatin1(
-          QCryptographicHash::hash(query.toUtf8(), QCryptographicHash::Sha256)
-              .toHex()) +
-      ".json";
-  QFile cached(file);
-  if (QFileInfo(file).lastModified().secsTo(QDateTime::currentDateTime()) <
-          30 * 86400 &&
-      cached.open(QIODevice::ReadOnly)) {
-    auto data = cached.readAll();
-    QTimer::singleShot(0, this, [=, this] {
-      if (!stopped)
-        finish(t, data);
-    });
-    return;
-  }
-  timer.disconnect(this);
-  connect(&timer, &QTimer::timeout, this, [=, this] {
-    QUrl url("https://musicbrainz.org/ws/2/recording/");
-    QUrlQuery q;
-    q.addQueryItem("query", query);
-    q.addQueryItem("fmt", "json");
-    q.addQueryItem("limit", "5");
-    url.setQuery(q);
-    QNetworkRequest request(url);
-    request.setRawHeader("User-Agent",
-                         ("MusicOrder/0.1.0 (" + contact + ")").toUtf8());
-    request.setTransferTimeout(20000);
-    elapsed.restart();
-    active = manager.get(request);
-    connect(active, &QNetworkReply::finished, this, [=, this] {
-      auto reply = active;
-      active = nullptr;
-      QByteArray data = reply->readAll();
-      QString error;
-      if (reply->error() != QNetworkReply::NoError)
-        error = reply->errorString();
-      int status =
-          reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-      if (status == 429 || status == 503) {
-        bool valid = false;
-        int seconds = reply->rawHeader("Retry-After").toInt(&valid);
-        delay = valid ? int(qBound(qint64(1100), qint64(seconds) * 1000,
-                                   qint64(86400000)))
-                      : 60000;
-        elapsed.restart();
-      } else
-        delay = 1100;
-      if (error.isEmpty()) {
-        QJsonParseError pe;
-        QJsonDocument::fromJson(data, &pe);
-        if (pe.error != QJsonParseError::NoError)
-          error = "Неверный JSON сервера";
-      }
-      if (error.isEmpty()) {
-        QSaveFile f(file);
-        if (f.open(QIODevice::WriteOnly)) {
-          f.write(data);
-          f.commit();
-        }
-      }
-      reply->deleteLater();
-      if (!stopped)
-        finish(t, data, error);
-    });
+  QUrl url("https://musicbrainz.org/ws/2/recording/");
+  QUrlQuery q;
+  q.addQueryItem("query", query);
+  q.addQueryItem("fmt", "json");
+  q.addQueryItem("limit", "5");
+  url.setQuery(q);
+  http->get(url, HttpClient::Kind::Json, this, [this, t](HttpResult result) {
+    if (result.error.isEmpty() &&
+        !QJsonDocument::fromJson(result.data).object()["recordings"].isArray())
+      result.error = "Ответ не содержит списка записей";
+    emit ready(t,
+               musicBrainzCandidates(t, result.error.isEmpty() ? result.data
+                                                               : QByteArray()),
+               result.error);
   });
-  timer.start(qMax(0, delay - int(elapsed.elapsed())));
 }
 QList<Candidate> musicBrainzCandidates(const Track &t, const QByteArray &data) {
   QList<Candidate> out;
@@ -124,6 +63,7 @@ QList<Candidate> musicBrainzCandidates(const Track &t, const QByteArray &data) {
     for (const auto &entry : recordings) {
       auto o = entry.toObject();
       Candidate c;
+      c.recordingId = o["id"].toString();
       c.fields["TITLE"] = o["title"].toString();
       QStringList artists;
       for (const auto &ac : o["artist-credit"].toArray()) {
@@ -196,10 +136,4 @@ QList<Candidate> musicBrainzCandidates(const Track &t, const QByteArray &data) {
                     "обложка неизвестны.";
   out << fallback;
   return out;
-}
-
-void MusicBrainz::finish(const Track &t, const QByteArray &data,
-                         const QString &error) {
-  emit ready(t, musicBrainzCandidates(t, error.isEmpty() ? data : QByteArray()),
-             error);
 }

@@ -17,6 +17,7 @@ struct Change {
   Track before;
   QMap<QString, QString> fields;
   std::optional<QByteArray> cover;
+  QMap<QString, QString> sources;
 };
 struct WriteResult {
   QString path, backup, error;
