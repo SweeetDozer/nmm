@@ -26,6 +26,24 @@ private:
     return QJsonDocument(QJsonObject{{"recordings", recordings}}).toJson();
   }
 private slots:
+  void noisyFilenameRegression() {
+    Track t;
+    t.path = "/music/YouTube/01. Редкий автор - Песня (Official Video) "
+             "[abcdefghijk].mp3";
+    auto local = localSuggestion(t);
+    qInfo() << "0.2 query inputs:" << local;
+    QCOMPARE(local.value("ARTIST"), QString("Редкий автор"));
+    QCOMPARE(local.value("TITLE"), QString("Песня"));
+  }
+  void numericFilenameRegression() {
+    Track t;
+    t.path = "/music/Unknown/123456789.mp3";
+    t.tags = {{"TITLE", {"000"}}, {"ARTIST", {"Unknown Artist"}}};
+    auto local = localSuggestion(t);
+    qInfo() << "0.2 numeric fallback:" << local;
+    QVERIFY(!local.contains("TITLE"));
+    QVERIFY(!local.contains("ARTIST"));
+  }
   void strictEvidence() {
     auto t = track();
     auto matches = musicBrainzCandidates(t, response());

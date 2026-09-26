@@ -7,6 +7,12 @@ struct HttpResult {
   QString error;
   int status = 0;
 };
+struct HttpOptions {
+  QByteArray form;
+  QMap<QByteArray, QByteArray> headers;
+  bool diskCache = true;
+  int intervalMs = 1100;
+};
 // One bounded, cancellable queue shared by recording/release/art/lyrics
 // requests.
 class HttpClient : public QObject {
@@ -15,7 +21,8 @@ public:
   using Callback = std::function<void(HttpResult)>;
   explicit HttpClient(QObject *parent = nullptr, QString cacheDirectory = {});
   ~HttpClient() override;
-  void get(const QUrl &url, Kind kind, QObject *context, Callback callback);
+  void get(const QUrl &url, Kind kind, QObject *context, Callback callback,
+           HttpOptions options = {});
   void cancel(QObject *context);
   void setContact(const QString &contact);
   static QString validate(const QByteArray &data, Kind kind);
@@ -28,6 +35,7 @@ private:
     Kind kind;
     QPointer<QObject> context;
     Callback callback;
+    HttpOptions options;
   };
   QNetworkAccessManager manager;
   QTimer timer;

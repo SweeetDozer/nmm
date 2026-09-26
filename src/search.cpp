@@ -16,43 +16,157 @@ QString versions(QString s) {
   return found.join(" ");
 }
 } // namespace
-MusicBrainz::MusicBrainz(QObject *parent, HttpClient *client)
-    : MetadataSource(parent) {
+QList<SearchQuery> musicBrainzQueries(const Track &t) {
+  QList<SearchQuery> out;
+  const auto local = localSuggestion(t);
+  const auto title = cleanSearchText(t.value("TITLE")),
+             artist = cleanSearchText(t.value("ARTIST"));
+  auto add = [&](QString label, QString name, QString performer) {
+    if (!meaningfulSearchText(name))
+      return;
+    QString query = "recording:" + quoted(name);
+    if (meaningfulSearchText(performer))
+      query += " AND artist:" + quoted(performer);
+    for (auto &previous : out)
+      if (previous.query == query)
+        return;
+    if (out.size() < 4)
+      out << SearchQuery{label, query};
+  };
+  add("Теги", title, artist);
+  add("Имя файла / папка", local.value("TITLE"), local.value("ARTIST"));
+  add("Название из файла без исполнителя", local.value("TITLE"), {});
+  add("Название из тегов без исполнителя", title, {});
+  return out;
+}
+MusicBrainz::MusicBrainz(QObject *parent, HttpClient *client, QUrl endpoint)
+    : MetadataSource(parent), endpoint(std::move(endpoint)) {
   http = client ? client : new HttpClient(this);
 }
-void MusicBrainz::cancel() { http->cancel(this); }
+void MusicBrainz::cancel() {
+  ++generation;
+  http->cancel(this);
+}
 void MusicBrainz::lookup(const Track &t) {
   cancel();
-  auto local = localSuggestion(t);
-  QString title =
-      t.value("TITLE").isEmpty() ? local["TITLE"] : t.value("TITLE");
-  QString artist =
-      t.value("ARTIST").isEmpty() ? local["ARTIST"] : t.value("ARTIST");
-  auto queryFor = [](const QString &name, const QString &performer) {
-    QString query = "recording:" + quoted(name);
-    if (!performer.isEmpty())
-      query += " AND artist:" + quoted(performer);
-    return query;
-  };
-  QString query = queryFor(title, artist);
-  const QString fromFile = queryFor(local["TITLE"], local["ARTIST"]);
-  if (query != fromFile)
-    query = "(" + query + ") OR (" + fromFile + ")";
-  QUrl url("https://musicbrainz.org/ws/2/recording/");
-  QUrlQuery q;
-  q.addQueryItem("query", query);
-  q.addQueryItem("fmt", "json");
-  q.addQueryItem("limit", "5");
-  url.setQuery(q);
-  http->get(url, HttpClient::Kind::Json, this, [this, t](HttpResult result) {
-    if (result.error.isEmpty() &&
-        !QJsonDocument::fromJson(result.data).object()["recordings"].isArray())
-      result.error = "Ответ не содержит списка записей";
-    emit ready(t,
-               musicBrainzCandidates(t, result.error.isEmpty() ? result.data
-                                                               : QByteArray()),
-               result.error);
-  });
+  current = t;
+  queries = musicBrainzQueries(t);
+  queryIndex = 0;
+  results.clear();
+  errors.clear();
+  emit diagnostic("MusicBrainz · " + QFileInfo(t.path).fileName() +
+                  " · исходные теги: " + t.value("ARTIST") + " — " +
+                  t.value("TITLE"));
+  if (!meaningfulSearchText(cleanSearchText(t.value("TITLE"))))
+    emit diagnostic(
+        "Тег TITLE пустой / числовой / служебный: не использован для запроса.");
+  if (!meaningfulSearchText(cleanSearchText(t.value("ARTIST"))))
+    emit diagnostic("Тег ARTIST пустой / числовой / служебный: ограничение по "
+                    "нему не используется.");
+  if (queries.isEmpty())
+    emit diagnostic("Нет осмысленного названия для текстового поиска. Запросы "
+                    "не отправлены; это НЕ отсутствие записи в каталоге. "
+                    "Уточните теги или используйте AcoustID.");
+  const auto run = generation;
+  QTimer::singleShot(0, this, [this, run] { next(run); });
+}
+void MusicBrainz::complete() {
+  int strong = 0;
+  for (auto &c : results)
+    strong += c.reliable;
+  if (strong > 1)
+    for (auto &c : results) {
+      c.reliable = false;
+      c.reason += " Несколько подходящих записей: требуется ручной выбор.";
+    }
+  const int count = results.size();
+  auto local = musicBrainzCandidates(current, {});
+  results.append(local);
+  emit diagnostic(QString("MusicBrainz · итог: %1 записей каталога; локальных "
+                          "подсказок %2; ошибок %3. Ничего не записано.")
+                      .arg(count)
+                      .arg(local.size())
+                      .arg(errors.size()));
+  emit ready(current, results, errors.join("\n"));
+}
+void MusicBrainz::next(quint64 run) {
+  if (run != generation)
+    return;
+  if (queryIndex >= queries.size()) {
+    complete();
+    return;
+  }
+  const auto query = queries[queryIndex++];
+  QUrl url = endpoint;
+  QUrlQuery params;
+  params.addQueryItem("query", query.query);
+  params.addQueryItem("fmt", "json");
+  params.addQueryItem("limit", "10");
+  url.setQuery(params);
+  emit diagnostic(QString("MusicBrainz · запрос %1/%2 · %3: %4")
+                      .arg(queryIndex)
+                      .arg(queries.size())
+                      .arg(query.label, query.query));
+  http->get(
+      url, HttpClient::Kind::Json, this, [this, run, query](HttpResult reply) {
+        if (run != generation)
+          return;
+        auto document = QJsonDocument::fromJson(reply.data);
+        if (reply.error.isEmpty() && !document.object()["recordings"].isArray())
+          reply.error = "Ответ не содержит списка записей";
+        if (!reply.error.isEmpty()) {
+          const auto error =
+              "MusicBrainz · ОШИБКА запроса (не «не найдено»): " + reply.error;
+          emit diagnostic(error);
+          errors << error;
+          complete();
+          return;
+        }
+        const auto raw = document.object()["recordings"].toArray();
+        emit diagnostic(
+            QString("MusicBrainz · получено %1 из %2 результатов сервиса (до "
+                    "10 на запрос).")
+                .arg(raw.size())
+                .arg(document.object().value("count").toInt(raw.size())));
+        auto parsed = musicBrainzCandidates(current, reply.data);
+        int displayed = 0, duplicates = 0, invalid = 0;
+        for (auto &c : parsed) {
+          if (!c.source.startsWith("MusicBrainz"))
+            continue;
+          if (c.fields.value("TITLE").trimmed().isEmpty()) {
+            ++invalid;
+            emit diagnostic(
+                "Отклонён повреждённый кандидат: отсутствует название.");
+            continue;
+          }
+          bool duplicate = false;
+          for (auto &old : results)
+            if (!c.recordingId.isEmpty() && old.recordingId == c.recordingId) {
+              duplicate = true;
+              break;
+            }
+          if (duplicate) {
+            ++duplicates;
+            continue;
+          }
+          emit diagnostic(
+              c.fields.value("ARTIST") + " — " + c.fields.value("TITLE") +
+              " · " +
+              (c.reliable ? "Сильное совпадение: "
+                          : "Не подтверждён, ПОКАЗАН для ручного выбора: ") +
+              c.reason);
+          c.reason += " Запрос: " + query.query;
+          results << c;
+          ++displayed;
+        }
+        emit diagnostic(QString("Показано новых: %1; объединено повторов MBID: "
+                                "%2; повреждённых: %3. Ноль результатов — "
+                                "ответ каталога, не сетевая ошибка.")
+                            .arg(displayed)
+                            .arg(duplicates)
+                            .arg(invalid));
+        QTimer::singleShot(0, this, [this, run] { next(run); });
+      });
 }
 QList<Candidate> musicBrainzCandidates(const Track &t, const QByteArray &data) {
   QList<Candidate> out;
@@ -134,6 +248,7 @@ QList<Candidate> musicBrainzCandidates(const Track &t, const QByteArray &data) {
   fallback.source = "Папка и имя файла";
   fallback.reason = "Локальная подсказка, требует проверки. Альбом, год и "
                     "обложка неизвестны.";
-  out << fallback;
+  if (!fallback.fields.isEmpty())
+    out << fallback;
   return out;
 }

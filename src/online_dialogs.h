@@ -7,7 +7,7 @@ void showFullImage(QWidget *parent, const QByteArray &data,
 class RecordingDialog : public QDialog {
 public:
   RecordingDialog(const Track &, const QList<Candidate> &, OnlineServices &,
-                  QWidget *parent = nullptr);
+                  QWidget *parent = nullptr, QString diagnostics = {});
   ~RecordingDialog() override;
   Change proposal() const;
   bool stopRequested() const { return stop; }

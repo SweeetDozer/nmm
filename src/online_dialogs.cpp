@@ -40,14 +40,15 @@ void showFullImage(QWidget *parent, const QByteArray &data,
   dialog.exec();
 }
 RecordingDialog::RecordingDialog(const Track &t, const QList<Candidate> &items,
-                                 OnlineServices &s, QWidget *parent)
+                                 OnlineServices &s, QWidget *parent,
+                                 QString diagnostics)
     : QDialog(parent), track(t), candidates(items), services(s) {
   setObjectName("recordingDialog");
   setWindowTitle("Запись → конкретное издание → предпросмотр");
   resize(1150, 850);
   auto v = new QVBoxLayout(this);
-  v->addWidget(
-      plainLabel(t.path + "\nВыберите запись. Альбом необязателен: ни одно "
+  v->addWidget(plainLabel(t.path +
+                          "\nВыберите запись. Альбом необязателен: ни одно "
                           "издание не выбирается автоматически."));
   recordings = new QListWidget;
   recordings->setObjectName("recordingCandidates");
@@ -60,6 +61,18 @@ RecordingDialog::RecordingDialog(const Track &t, const QList<Candidate> &items,
         (c.reliable ? " · сильное совпадение" : " · требуется проверка") +
         "\n" + c.reason);
   v->addWidget(recordings);
+  if (!diagnostics.isEmpty()) {
+    auto journal = new QPlainTextEdit;
+    journal->setObjectName("candidateSearchLog");
+    journal->setReadOnly(true);
+    journal->setPlainText(diagnostics);
+    journal->setMaximumHeight(150);
+    v->addWidget(journal);
+  }
+  if (candidates.isEmpty())
+    v->addWidget(
+        plainLabel("Предложений нет. Причина показана в журнале: пустой ответ, "
+                   "ошибка или недостаточно данных — это разные ситуации."));
   state = plainLabel(
       "MusicBrainz получает идентификатор записи; Cover Art Archive — "
       "идентификатор выбранного издания. Аудиофайл не отправляется.");

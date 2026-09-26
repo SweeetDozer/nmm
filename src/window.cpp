@@ -157,6 +157,11 @@ Window::Window() {
     preview(list);
   });
   add("MusicBrainz", [this] { search(); });
+  add("Распознать AcoustID", [this] { search(true); });
+  add("Discogs", [this] { findDiscogs(); });
+  add("Настройки поиска", [this] { searchSettings(); });
+  auto journal = toolbar->addAction("Журнал поиска");
+  connect(journal, &QAction::triggered, this, &Window::showSearchJournal);
   add("Текст песни", [this] { findLyrics(); });
   lyricsAction = taskActions.last();
   lyricsAction->setEnabled(false);
@@ -240,19 +245,33 @@ Window::Window() {
   layout->addLayout(bottom);
   log = new QPlainTextEdit;
   log->setReadOnly(true);
+  log->setMaximumBlockCount(10000);
   log->setMaximumHeight(105);
   log->setPlaceholderText("Журнал операций. Резервные копии: " + storage);
   layout->addWidget(log);
   network = new HttpClient(this);
   online = std::make_unique<OnlineServices>(*network);
   source = new MusicBrainz(this, network);
+  acoustid = new AcoustId(*network, this);
+  discogs = std::make_unique<DiscogsService>(*network);
+  QSettings preferences;
+  acoustidKey = preferences.value("acoustid/clientKey").toString();
+  discogsToken = preferences.value("discogs/token").toString();
+  fpcalcPath = preferences.value("chromaprint/executable").toString();
+  acoustid->configure(acoustidKey, fpcalcPath);
+  for (auto provider : QList<MetadataSource *>{source, acoustid}) {
+    connect(provider, &MetadataSource::diagnostic, this,
+            &Window::searchDiagnostic);
+    connect(provider, &MetadataSource::ready, this, &Window::chooseCandidates);
+  }
   connect(
       table->selectionModel(), &QItemSelectionModel::selectionChanged, this,
       [this] { lyricsAction->setEnabled(!busy && selected().size() == 1); });
-  connect(source, &MetadataSource::ready, this, &Window::chooseCandidates);
+
   connect(cancelButton, &QPushButton::clicked, this, [this] {
     cancelled = true;
-    source->cancel();
+    if (activeSource)
+      activeSource->cancel();
     if (!searchQueue.isEmpty() || searchTotal) {
       searchQueue.clear();
       searchTotal = 0;
@@ -279,6 +298,10 @@ Window::Window() {
 }
 Window::~Window() {
   cancelled = true;
+  delete acoustid;
+  acoustid = nullptr;
+  activeSource = nullptr;
+  source->cancel();
   job.waitForFinished();
 }
 void Window::closeEvent(QCloseEvent *e) {
@@ -695,20 +718,47 @@ void Window::write(QList<Change> changes) {
     });
   });
 }
-void Window::search() {
+void Window::search(bool fingerprint) {
   searchQueue = selected();
   if (searchQueue.isEmpty()) {
-    message("Выберите файлы для поиска MusicBrainz.");
+    message("Выберите файлы для поиска.");
     return;
   }
+  if (fingerprint) {
+    if (acoustidKey.isEmpty() ||
+        (fpcalcPath.isEmpty() &&
+         QStandardPaths::findExecutable("fpcalc").isEmpty())) {
+      QMessageBox::information(
+          this, "AcoustID / Chromaprint",
+          "Для распознавания нужен собственный application/client key AcoustID "
+          "и локальный fpcalc. Настройки откроются сейчас.");
+      searchSettings();
+      if (acoustidKey.isEmpty() ||
+          (fpcalcPath.isEmpty() &&
+           QStandardPaths::findExecutable("fpcalc").isEmpty()))
+        return;
+    }
+    if (QMessageBox::question(
+            this, "Распознавание выбранных файлов",
+            QString("Файлов: %1. Chromaprint локально вычислит отпечаток "
+                    "первых 120 секунд каждого файла. В AcoustID уйдут "
+                    "отпечаток и длительность; сам аудиофайл, путь и теги не "
+                    "отправляются. Все результаты потребуют ручного выбора и "
+                    "подтверждения. Продолжить?")
+                .arg(searchQueue.size())) != QMessageBox::Yes)
+      return;
+    acoustid->configure(acoustidKey, fpcalcPath);
+  }
+  activeSource = fingerprint ? static_cast<MetadataSource *>(acoustid) : source;
   QSettings settings;
   QString contact =
       settings
           .value("musicbrainz/contact", "https://github.com/SweeetDozer/nmm")
           .toString();
-  message("MusicBrainz: передаются название и исполнитель из тегов / имён. "
-          "User-Agent: MusicOrder/0.2.0 (" +
-          contact + ")");
+  message(fingerprint ? "AcoustID: передаются только отпечаток и длительность; "
+                        "аудио и текстовые теги не отправляются."
+                      : "MusicBrainz: передаются поисковые название и "
+                        "исполнитель из тегов / имён.");
   source->setContact(contact);
   searchChanges.clear();
   searchDone = 0;
@@ -726,11 +776,14 @@ void Window::nextSearch() {
     return;
   }
   auto t = searchQueue.takeFirst();
-  status->setText(QString("MusicBrainz %1 / %2 · %3")
-                      .arg(searchDone + 1)
-                      .arg(searchTotal)
-                      .arg(QFileInfo(t.path).fileName()));
-  source->lookup(t);
+  trackJournal.clear();
+  status->setText(
+      QString((activeSource == acoustid ? "AcoustID" : "MusicBrainz") +
+              QString(" %1 / %2 · %3"))
+          .arg(searchDone + 1)
+          .arg(searchTotal)
+          .arg(QFileInfo(t.path).fileName()));
+  activeSource->lookup(t);
 }
 void Window::chooseCandidates(const Track &t,
                               const QList<Candidate> &candidates,
@@ -740,19 +793,147 @@ void Window::chooseCandidates(const Track &t,
   ++searchDone;
   progress->setValue(searchDone);
   if (!error.isEmpty())
-    message("MusicBrainz: " + error + " · " + t.path);
+    message("Ошибка источника: " + error + " · " + t.path);
   auto current = readTrack(t.path);
   if (!current.error.isEmpty()) {
     message(current.error);
     QTimer::singleShot(0, this, &Window::nextSearch);
     return;
   }
-  RecordingDialog dialog(current, candidates, *online, this);
+  RecordingDialog dialog(
+      current, candidates, *online, this,
+      trackJournal.join("\n") +
+          (error.isEmpty() ? QString() : "\nОШИБКА: " + error));
   if (dialog.exec() == QDialog::Accepted)
     searchChanges << dialog.proposal();
   if (dialog.stopRequested())
     cancelled = true;
   QTimer::singleShot(0, this, &Window::nextSearch);
+}
+void Window::searchDiagnostic(const QString &text) {
+  QString safe = text;
+  if (!acoustidKey.isEmpty())
+    safe.replace(acoustidKey, "[ключ скрыт]");
+  if (!discogsToken.isEmpty())
+    safe.replace(discogsToken, "[токен скрыт]");
+  trackJournal << safe;
+  searchJournal << QTime::currentTime().toString("HH:mm:ss") + "  " + safe;
+  while (searchJournal.size() > 10000)
+    searchJournal.removeFirst();
+  message(safe);
+}
+void Window::showSearchJournal() {
+  QDialog dialog(this);
+  dialog.setWindowTitle("Журнал поиска · последние 10000 сообщений");
+  dialog.resize(1000, 700);
+  auto layout = new QVBoxLayout(&dialog);
+  auto text = new QPlainTextEdit;
+  text->setReadOnly(true);
+  text->setPlainText(searchJournal.join("\n"));
+  layout->addWidget(text);
+  QTimer refresh;
+  connect(&refresh, &QTimer::timeout, &dialog, [&, this] {
+    if (text->toPlainText() != searchJournal.join("\n"))
+      text->setPlainText(searchJournal.join("\n"));
+  });
+  refresh.start(500);
+  auto buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  layout->addWidget(buttons);
+  dialog.exec();
+}
+void Window::searchSettings() {
+  QDialog dialog(this);
+  dialog.setWindowTitle("Настройки источников поиска");
+  dialog.resize(760, 430);
+  auto layout = new QVBoxLayout(&dialog);
+  auto form = new QFormLayout;
+  auto key = new QLineEdit(acoustidKey);
+  key->setEchoMode(QLineEdit::Password);
+  auto token = new QLineEdit(discogsToken);
+  token->setEchoMode(QLineEdit::Password);
+  auto executable = new QLineEdit(fpcalcPath);
+  executable->setPlaceholderText(
+      "fpcalc из PATH или полный путь к исполняемому файлу");
+  form->addRow("AcoustID application/client key", key);
+  form->addRow("Discogs personal access token", token);
+  form->addRow("Chromaprint fpcalc", executable);
+  layout->addLayout(form);
+  auto browse = new QPushButton("Выбрать fpcalc…");
+  layout->addWidget(browse);
+  connect(browse, &QPushButton::clicked, &dialog, [&] {
+    auto path =
+        QFileDialog::getOpenFileName(&dialog, "Исполняемый файл fpcalc");
+    if (!path.isEmpty())
+      executable->setText(path);
+  });
+  auto info = new QLabel(
+      "AcoustID: нужен ключ зарегистрированного приложения (client), не "
+      "пользовательский ключ отправки отпечатков. Бесплатный сервис "
+      "предназначен для некоммерческого использования. Fedora: sudo dnf "
+      "install chromaprint-tools.\nDiscogs: токен нужен для API-поиска; без "
+      "него доступна загрузка издания по ID и поиск в браузере.\nКлючи не "
+      "попадают в журнал. По умолчанию действуют только в этой сессии.");
+  info->setWordWrap(true);
+  layout->addWidget(info);
+  auto links = new QLabel(
+      "<a href=\"https://acoustid.org/new-application\">Зарегистрировать "
+      "приложение AcoustID</a> · <a "
+      "href=\"https://www.discogs.com/settings/developers\">Токен Discogs</a>");
+  links->setOpenExternalLinks(true);
+  layout->addWidget(links);
+  auto persist = new QCheckBox(
+      "Сохранить ключи на этом компьютере в QSettings (без шифрования)");
+  QSettings settings;
+  persist->setChecked(settings.contains("acoustid/clientKey") ||
+                      settings.contains("discogs/token"));
+  layout->addWidget(persist);
+  auto buttons =
+      new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
+  layout->addWidget(buttons);
+  connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  if (dialog.exec() != QDialog::Accepted)
+    return;
+  acoustidKey = key->text().trimmed();
+  discogsToken = token->text().trimmed();
+  fpcalcPath = executable->text().trimmed();
+  if (persist->isChecked()) {
+    settings.setValue("acoustid/clientKey", acoustidKey);
+    settings.setValue("discogs/token", discogsToken);
+  } else {
+    settings.remove("acoustid/clientKey");
+    settings.remove("discogs/token");
+  }
+  settings.setValue("chromaprint/executable", fpcalcPath);
+  settings.sync();
+#ifndef Q_OS_WIN
+  QFile::setPermissions(settings.fileName(),
+                        QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+#endif
+  acoustid->configure(acoustidKey, fpcalcPath);
+}
+void Window::findDiscogs() {
+  auto chosen = selected();
+  if (chosen.size() != 1) {
+    message("Для Discogs выберите один трек: издание и позицию в треклисте "
+            "нужно проверить вручную.");
+    return;
+  }
+  auto track = readTrack(chosen.first().path);
+  if (!track.error.isEmpty()) {
+    message(track.error);
+    return;
+  }
+  DiscogsDialog dialog(track, *discogs, discogsToken, this);
+  const auto result = dialog.exec();
+  for (auto &line : dialog.journal())
+    searchDiagnostic(line);
+  if (result == QDialog::Accepted) {
+    auto change = dialog.proposal();
+    if (change)
+      preview({*change});
+  }
 }
 void Window::findLyrics() {
   const auto tracks = selected();

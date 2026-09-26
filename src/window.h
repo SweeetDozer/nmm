@@ -1,5 +1,7 @@
 #pragma once
+#include "acoustid.h"
 #include "core.h"
+#include "discogs.h"
 #include "online_dialogs.h"
 #include "search.h"
 #include <QAudioOutput>
@@ -62,6 +64,15 @@ private:
   QFuture<void> job;
   bool busy = false;
   MusicBrainz *source;
+  AcoustId *acoustid;
+  MetadataSource *activeSource = nullptr;
+  std::unique_ptr<DiscogsService> discogs;
+  QString acoustidKey, discogsToken, fpcalcPath;
+  QStringList searchJournal, trackJournal;
+  void searchSettings();
+  void searchDiagnostic(const QString &message);
+  void showSearchJournal();
+  void findDiscogs();
   HttpClient *network;
   std::unique_ptr<OnlineServices> online;
   QAction *lyricsAction = nullptr;
@@ -79,7 +90,7 @@ private:
   void preview(QList<Change> changes);
   void write(QList<Change> changes);
   void duplicates();
-  void search();
+  void search(bool fingerprint = false);
   void nextSearch();
   void chooseCandidates(const Track &, const QList<Candidate> &,
                         const QString &);

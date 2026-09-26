@@ -28,6 +28,8 @@ WriteResult writeTrack(const Change &change, const QString &backupRoot);
 QByteArray fileHash(const QString &path, std::atomic_bool *cancel = nullptr);
 QString quarantineFile(const Track &track, const QString &root, QString &error);
 QString cleanTitle(QString name);
+QString cleanSearchText(QString text);
+bool meaningfulSearchText(const QString &text);
 QString normalized(QString text);
 QMap<QString, QString> localSuggestion(const Track &track);
 QStringList editableFields();

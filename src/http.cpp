@@ -23,7 +23,7 @@ HttpClient::~HttpClient() {
   }
 }
 void HttpClient::setContact(const QString &contact) {
-  userAgent = ("MusicOrder/0.2.0 (" + contact + ")").toUtf8();
+  userAgent = ("MusicOrder/0.3.0 (" + contact + ")").toUtf8();
 }
 QString HttpClient::cachePath(const Request &r) const {
   return cache + "/" +
@@ -59,7 +59,7 @@ QString HttpClient::validate(const QByteArray &data, Kind kind) {
   return {};
 }
 void HttpClient::get(const QUrl &url, Kind kind, QObject *context,
-                     Callback callback) {
+                     Callback callback, HttpOptions options) {
   // HTTP is accepted only for loopback fixture servers. Production endpoints
   // use HTTPS.
   if (!url.isValid() ||
@@ -71,7 +71,7 @@ void HttpClient::get(const QUrl &url, Kind kind, QObject *context,
     });
     return;
   }
-  queue.enqueue({url, kind, context, std::move(callback)});
+  queue.enqueue({url, kind, context, std::move(callback), std::move(options)});
   if (!active)
     timer.start(0);
 }
@@ -97,8 +97,8 @@ void HttpClient::pump() {
   const auto age =
       QFileInfo(f).lastModified().secsTo(QDateTime::currentDateTime());
   const qint64 limit = r.kind == Kind::Image ? ImageLimit : JsonLimit;
-  if (age >= 0 && age < 30 * 86400 && f.size() <= limit &&
-      f.open(QIODevice::ReadOnly)) {
+  if (r.options.diskCache && age >= 0 && age < 30 * 86400 &&
+      f.size() <= limit && f.open(QIODevice::ReadOnly)) {
     auto data = f.readAll();
     f.close();
     if (validate(data, r.kind).isEmpty()) {
@@ -119,14 +119,24 @@ void HttpClient::pump() {
     timer.start(0);
     return;
   }
-  nextRequest[r.url.host()] = clock.elapsed() + 1100;
+  nextRequest[r.url.host()] =
+      clock.elapsed() + qMax(1100, r.options.intervalMs);
   QNetworkRequest request(r.url);
   request.setRawHeader("User-Agent", userAgent);
   request.setTransferTimeout(20000);
   request.setMaximumRedirectsAllowed(5);
   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                        QNetworkRequest::NoLessSafeRedirectPolicy);
-  auto reply = manager.get(request);
+  for (auto it = r.options.headers.begin(); it != r.options.headers.end(); ++it)
+    request.setRawHeader(it.key(), it.value());
+  if (!r.options.form.isEmpty())
+    request.setHeader(QNetworkRequest::ContentTypeHeader,
+                      "application/x-www-form-urlencoded");
+  if (!r.options.form.isEmpty() || !r.options.headers.isEmpty())
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                         QNetworkRequest::ManualRedirectPolicy);
+  auto reply = r.options.form.isEmpty() ? manager.get(request)
+                                        : manager.post(request, r.options.form);
   active = reply;
   activeContext = r.context;
   reply->setReadBufferSize(64 * 1024);
@@ -193,7 +203,7 @@ void HttpClient::pump() {
         if (result.error.isEmpty()) {
           result.data = *body;
           QSaveFile f(path);
-          if (f.open(QIODevice::WriteOnly)) {
+          if (r.options.diskCache && f.open(QIODevice::WriteOnly)) {
             f.write(result.data);
             f.commit();
           }

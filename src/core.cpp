@@ -225,14 +225,44 @@ QString quarantineFile(const Track &t, const QString &root, QString &error) {
   }
   return dest;
 }
-QString cleanTitle(QString s) {
-  s = QFileInfo(s).completeBaseName();
-  s.replace(QRegularExpression("\\[[A-Za-z0-9_-]{11}\\]$"), "");
-  s.replace(QRegularExpression("\\b(official\\s+(music\\s+)?video|official "
-                               "audio|lyrics video|1080p|720p)\\b",
+QString cleanSearchText(QString s) {
+  s = s.normalized(QString::NormalizationForm_KC);
+  s.replace(QRegularExpression("https?://\\S+|www\\.\\S+",
                                QRegularExpression::CaseInsensitiveOption),
-            "");
-  return s.simplified();
+            " ");
+  s.replace(QRegularExpression("\\[[A-Za-z0-9_-]{11}\\]"), " ");
+  s.replace(QRegularExpression(
+                "\\b(official\\s+(music\\s+)?video|official\\s+audio|lyrics?"
+                "\\s+video|\\d{3,4}p|\\d{2,3}\\s*kbps|HD|HQ)\\b",
+                QRegularExpression::CaseInsensitiveOption),
+            " ");
+  s.replace(QRegularExpression("^\\s*\\d{1,3}\\s*[.)_-]\\s*"), "");
+  s.replace(QRegularExpression("[\\[(]\\s*[\\])]"), " ");
+  s.replace('_', ' ');
+  return s.simplified().left(256);
+}
+bool meaningfulSearchText(const QString &s) {
+  const auto text = normalized(s);
+  static const QStringList junk = {"unknown",       "unknown artist",
+                                   "unknown title", "unknown album",
+                                   "untitled",      "track",
+                                   "audio",         "video",
+                                   "music",         "youtube",
+                                   "downloads",     "download",
+                                   "неизвестный",   "неизвестный исполнитель",
+                                   "без названия",  "трек",
+                                   "музыка",        "n/a",
+                                   "null",          "none"};
+  return !junk.contains(text) && text.contains(QRegularExpression("\\p{L}")) &&
+         !text.contains(
+             QRegularExpression("^(track|audio|video|трек)\\s*\\d*$",
+                                QRegularExpression::CaseInsensitiveOption));
+}
+QString cleanTitle(QString s) {
+  const QString ext = QFileInfo(s).suffix().toLower();
+  if (QStringList{"mp3", "flac", "ogg"}.contains(ext))
+    s = QFileInfo(s).completeBaseName();
+  return cleanSearchText(s);
 }
 QString normalized(QString s) {
   return s.normalized(QString::NormalizationForm_KC)
@@ -240,6 +270,17 @@ QString normalized(QString s) {
       .simplified();
 }
 QMap<QString, QString> localSuggestion(const Track &t) {
-  return {{"TITLE", cleanTitle(QFileInfo(t.path).fileName())},
-          {"ARTIST", QFileInfo(t.path).dir().dirName()}};
+  QString title = cleanTitle(QFileInfo(t.path).fileName());
+  QString artist = cleanSearchText(QFileInfo(t.path).dir().dirName());
+  const auto delimiter = QRegularExpression("\\s+[-–—]\\s+").match(title);
+  if (delimiter.hasMatch()) {
+    artist = title.left(delimiter.capturedStart()).trimmed();
+    title = title.mid(delimiter.capturedEnd()).trimmed();
+  }
+  QMap<QString, QString> result;
+  if (meaningfulSearchText(title))
+    result["TITLE"] = title;
+  if (meaningfulSearchText(artist))
+    result["ARTIST"] = artist;
+  return result;
 }
